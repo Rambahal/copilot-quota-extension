@@ -1,0 +1,70 @@
+{
+  "name": "copilot-quota-monitor",
+  "displayName": "Copilot Quota Monitor",
+  "description": "Shows GitHub Copilot quota, remaining allowance, and reset date in the VS Code status bar.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Rambahal?tab=repositories"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:copilotQuota.refresh",
+    "onCommand:copilotQuota.showDetails"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotQuota.refresh",
+        "title": "Copilot Quota: Refresh"
+      },
+      {
+        "command": "copilotQuota.showDetails",
+        "title": "Copilot Quota: Show Details"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Quota Monitor",
+      "properties": {
+        "copilotQuota.refreshIntervalMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 60,
+          "description": "How often to refresh Copilot quota information."
+        },
+        "copilotQuota.quotaType": {
+          "type": "string",
+          "default": "premium_interactions",
+          "description": "Copilot quota snapshot to display. Common values are premium_interactions, chat, and completions."
+        },
+        "copilotQuota.showResetDate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the quota reset date in the status bar tooltip."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npm run compile && npx @vscode/vsce package",
+    "check": "npm run compile"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "^1.0.14"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.6.0",
+    "typescript": "^5.7.0"
+  }
+}

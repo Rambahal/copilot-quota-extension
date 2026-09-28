@@ -1,0 +1,7 @@
+.vscode/
+.git/
+.gitignore
+src/
+tsconfig.json
+*.map
+README.md
