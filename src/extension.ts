@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { CopilotClient } from '@github/copilot-sdk';
+import type { CopilotClient } from '@github/copilot-sdk' with { 'resolution-mode': 'import' };
 
 type QuotaSnapshot = {
     entitlementRequests: number;
@@ -75,9 +75,8 @@ async function getClient(): Promise<CopilotClient> {
         return client;
     }
 
-    client = new CopilotClient({
-        clientName: 'vscode-copilot-quota-monitor'
-    });
+    const { CopilotClient } = await import('@github/copilot-sdk');
+    client = new CopilotClient();
 
     await client.start();
     return client;
@@ -181,7 +180,7 @@ function buildTooltip(type: string, snapshot: QuotaSnapshot): vscode.MarkdownStr
     md.isTrusted = false;
 
     md.appendMarkdown(`**GitHub Copilot quota**\n\n`);
-    md.appendMarkdown(`Quota: \`${escapeMarkdown(type)}\`\n\n`);
+    md.appendMarkdown(`Quota: ${formatQuotaType(type)}\n\n`);
 
     if (snapshot.entitlementRequests < 0) {
         md.appendMarkdown(`**Allowance:** Unlimited\n\n`);
@@ -221,7 +220,7 @@ async function showDetails(): Promise<void> {
         : Math.max(0, snapshot.entitlementRequests - snapshot.usedRequests);
 
     const lines = [
-        `Quota: ${lastQuotaType}`,
+        `Quota: ${formatQuotaType(lastQuotaType)}`,
         unlimited
             ? 'Allowance: Unlimited'
             : `Used: ${snapshot.usedRequests.toLocaleString()} / ${snapshot.entitlementRequests.toLocaleString()}`,
@@ -243,6 +242,10 @@ async function showDetails(): Promise<void> {
 
 function formatPercent(value: number): string {
     return Number.isInteger(value) ? value.toString() : value.toFixed(1);
+}
+
+function formatQuotaType(type: string): string {
+    return type === 'premium_interactions' ? 'Premium model' : type;
 }
 
 function formatDate(value: string): string {

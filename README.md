@@ -11,43 +11,20 @@ A small VS Code extension that shows GitHub Copilot quota information in the sta
 - Reset date
 - Quota type returned by Copilot
 
-The default quota is `premium_interactions`.
+The default quota is displayed as **Premium model**. Its SDK quota key is `premium_interactions`.
 
 ## Requirements
 
-- VS Code 1.90+
+- VS Code 1.134+
 - Node.js 20.19+ or Node.js 22.12+ for the current Copilot SDK
 - A GitHub Copilot subscription/account supported by the Copilot SDK
 - Copilot CLI authentication available to the SDK
 
 The current GitHub Copilot SDK documentation says the Node.js SDK requires Node.js `^20.19.0` or `>=22.12.0`, and the SDK bundles the Copilot CLI runtime. See the GitHub documentation for authentication details.
 
-## Install from source
+## Install
 
-```bash
-npm install
-npm run compile
-code --extensionDevelopmentPath="$(pwd)"
-```
-
-On Windows PowerShell:
-
-```powershell
-npm install
-npm run compile
-code --extensionDevelopmentPath="$PWD"
-```
-
-Or open the folder in VS Code and press `F5`.
-
-## Package a VSIX
-
-```bash
-npm install
-npm run package
-```
-
-This produces a `.vsix` file. Install it from VS Code with **Extensions → … → Install from VSIX…**.
+Install the provided `copilot-quota-monitor-0.1.0.vsix` file in VS Code using **Extensions → … → Install from VSIX…**. Once installed, the quota monitor appears in the status bar.
 
 ## Authentication
 

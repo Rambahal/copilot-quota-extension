@@ -3,14 +3,14 @@
   "displayName": "Copilot Quota Monitor",
   "description": "Shows GitHub Copilot quota, remaining allowance, and reset date in the VS Code status bar.",
   "version": "0.1.0",
-  "publisher": "local",
+  "publisher": "Rambahal",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Rambahal?tab=repositories"
+    "url": "https://github.com/Rambahal/copilot-quota-extension"
   },
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.134.0"
   },
   "main": "./out/extension.js",
   "activationEvents": [
@@ -42,7 +42,7 @@
         "copilotQuota.quotaType": {
           "type": "string",
           "default": "premium_interactions",
-          "description": "Copilot quota snapshot to display. Common values are premium_interactions, chat, and completions."
+          "description": "SDK quota key to display. The default key, premium_interactions, appears as Premium model. Other common keys are chat and completions."
         },
         "copilotQuota.showResetDate": {
           "type": "boolean",
