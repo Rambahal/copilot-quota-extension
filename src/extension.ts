@@ -15,11 +15,16 @@ type QuotaResult = {
 let client: CopilotClient | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
 let statusBar: vscode.StatusBarItem | undefined;
+let outputChannel: vscode.OutputChannel | undefined;
 let lastSnapshot: QuotaSnapshot | undefined;
 let lastQuotaType = 'premium_interactions';
 let loading = false;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    outputChannel = vscode.window.createOutputChannel('Copilot Quota');
+    context.subscriptions.push(outputChannel);
+    log('Extension activated.');
+
     statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBar.command = 'copilotQuota.showDetails';
     statusBar.tooltip = 'GitHub Copilot quota';
@@ -72,13 +77,16 @@ function configureRefreshTimer(): void {
 
 async function getClient(): Promise<CopilotClient> {
     if (client) {
+        log('Reusing Copilot SDK client.');
         return client;
     }
 
+    log('Creating and starting Copilot SDK client.');
     const { CopilotClient } = await import('@github/copilot-sdk');
     client = new CopilotClient();
 
     await client.start();
+    log('Copilot SDK client started.');
     return client;
 }
 
@@ -86,10 +94,13 @@ async function getQuota(): Promise<{ type: string; snapshot: QuotaSnapshot }> {
     const configuredType = vscode.workspace
         .getConfiguration('copilotQuota')
         .get<string>('quotaType', 'premium_interactions');
+    log(`Requesting quota. Configured quota type: ${configuredType}`);
 
     const copilot = await getClient();
     const result = await copilot.rpc.account.getQuota({}) as QuotaResult;
     const snapshots = result.quotaSnapshots ?? {};
+    log(`Quota response keys: ${Object.keys(snapshots).join(', ') || '(none)'}`);
+    log(`Quota response: ${safeJson(result)}`);
 
     let quotaType = configuredType;
     let snapshot = snapshots[quotaType];
@@ -105,6 +116,7 @@ async function getQuota(): Promise<{ type: string; snapshot: QuotaSnapshot }> {
 
     if (!snapshot) {
         const available = Object.keys(snapshots);
+        log(`Configured quota type '${configuredType}' was not selected. Available quotas: ${available.join(', ') || '(none)'}`);
         throw new Error(
             available.length
                 ? `Quota '${configuredType}' was not returned. Available quotas: ${available.join(', ')}`
@@ -112,6 +124,7 @@ async function getQuota(): Promise<{ type: string; snapshot: QuotaSnapshot }> {
         );
     }
 
+    log(`Selected quota '${quotaType}': ${safeJson(snapshot)}`);
     return { type: quotaType, snapshot };
 }
 
@@ -125,12 +138,17 @@ async function refresh(showErrors: boolean): Promise<void> {
 
     try {
         const { type, snapshot } = await getQuota();
+        log(`Updating status bar from quota '${type}' with remainingPercentage=${String(snapshot.remainingPercentage)}, usedRequests=${String(snapshot.usedRequests)}, entitlementRequests=${String(snapshot.entitlementRequests)}.`);
         lastQuotaType = type;
         lastSnapshot = snapshot;
         updateStatusBar(type, snapshot);
     } catch (error) {
         lastSnapshot = undefined;
         const message = error instanceof Error ? error.message : String(error);
+        log(`Quota refresh failed: ${message}`);
+        if (error instanceof Error && error.stack) {
+            log(error.stack);
+        }
         setStatusError(message);
 
         if (showErrors) {
@@ -144,6 +162,18 @@ async function refresh(showErrors: boolean): Promise<void> {
         }
     } finally {
         loading = false;
+    }
+}
+
+function log(message: string): void {
+    outputChannel?.appendLine(`[${new Date().toISOString()}] ${message}`);
+}
+
+function safeJson(value: unknown): string {
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return '[Unable to serialize value]';
     }
 }
 
