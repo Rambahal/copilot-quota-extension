@@ -25,6 +25,10 @@
         "title": "Copilot Quota: Refresh"
       },
       {
+        "command": "copilotQuota.signIn",
+        "title": "Copilot Quota: Sign In"
+      },
+      {
         "command": "copilotQuota.showDetails",
         "title": "Copilot Quota: Show Details"
       }
@@ -56,6 +60,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "npm run compile && npx @vscode/vsce package",
+    "test": "npm run compile && node --experimental-vm-modules --test test/*.test.cjs",
     "check": "npm run compile"
   },
   "dependencies": {

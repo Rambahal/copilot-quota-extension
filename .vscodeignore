@@ -2,6 +2,8 @@
 .git/
 .gitignore
 src/
+test/
+*.vsix
 tsconfig.json
 *.map
 README.md
