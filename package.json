@@ -2,8 +2,9 @@
   "name": "copilot-quota-monitor",
   "displayName": "Copilot Quota Monitor",
   "description": "Shows GitHub Copilot quota, remaining allowance, and reset date in the VS Code status bar.",
-  "version": "0.1.0",
-  "publisher": "Rambahal",
+  "version": "0.1.2",
+  "publisher": "RamBahalTiwari",
+  "icon": "assets/copilot-quota-logo.png",
   "license": "MIT",
   "repository": {
     "type": "git",

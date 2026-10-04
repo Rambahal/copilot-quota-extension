@@ -275,6 +275,25 @@ test('usage warnings fire at 50, 75 and 90 percent used without repeating on ref
     }
 });
 
+test('burn rate details show projected remaining and windowed usage pacing', async () => {
+    const date = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    const settings = {
+        cliAuthenticated: true,
+        snapshot: {
+            entitlementRequests: 1000,
+            usedRequests: 750,
+            remainingPercentage: 25,
+            resetDate: date
+        }
+    };
+    const harness = await createHarness(settings);
+    await harness.commands.get('copilotQuota.showDetails')();
+    assert.equal(harness.details.length, 1);
+    assert.match(harness.details[0].options.detail, /Average: \d+ per day/);
+    assert.match(harness.details[0].options.detail, /Estimated usage until reset:/);
+    assert.match(harness.details[0].options.detail, /Projected remaining:/);
+});
+
 test('usage jumps show only the highest warning and reset dates rearm notifications', async () => {
     const settings = {
         cliAuthenticated: true,

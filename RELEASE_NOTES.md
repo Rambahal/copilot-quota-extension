@@ -1,4 +1,4 @@
-# Copilot Quota Monitor v0.1.0
+# Copilot Quota Monitor v0.1.2
 
 Track your GitHub Copilot allowance directly in the VS Code status bar.
 
@@ -6,6 +6,7 @@ Track your GitHub Copilot allowance directly in the VS Code status bar.
 
 - View remaining quota, used requests, allowance, and reset date.
 - Receive usage warnings at 50%, 75%, and 90% used without repeated alerts on every refresh.
+- See the average daily burn rate, estimated usage through reset, and projected remaining allowance in usage details. Threshold warnings also include burn-rate context when a reset date is available.
 - Open a theme-aware Model Suggestions tab with task-based recommendations and a link to current pricing.
 - Sign in through VS Code's GitHub authentication, with SDK/CLI authentication available as a fallback.
 - Support GitHub Enterprise Cloud with data residency through the `github-enterprise.uri` setting.
@@ -13,7 +14,7 @@ Track your GitHub Copilot allowance directly in the VS Code status bar.
 
 ## Installation
 
-1. Download `copilot-quota-monitor-0.1.0.vsix` from this release's Assets section.
+1. Download `copilot-quota-monitor-0.1.2.vsix` from this release's Assets section.
 2. In VS Code, open Extensions and choose **Install from VSIX...** from the menu.
 3. Select the downloaded package and reload VS Code if prompted.
 4. Run **Copilot Quota: Sign In** and authorize the GitHub account with your Copilot subscription.

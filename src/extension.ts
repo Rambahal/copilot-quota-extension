@@ -12,6 +12,14 @@ type QuotaResult = {
     quotaSnapshots?: Record<string, QuotaSnapshot>;
 };
 
+type BurnRateSummary = {
+    averagePerDay: number;
+    projectedUsageUntilReset: number;
+    projectedRemaining: number;
+    daysRemaining: number;
+    isHighRate: boolean;
+};
+
 let client: CopilotClient | undefined;
 let clientToken: string | undefined;
 let clientHost: string | undefined;
@@ -225,12 +233,22 @@ function warnAboutUsage(type: string, snapshot: QuotaSnapshot): void {
     if (!snapshot.resetDate && used === 0) {
         warnedThresholds.delete(key);
     }
-    const threshold = [90, 75, 50].find(value => used >= value);
-    if (threshold === undefined || threshold <= (warnedThresholds.get(key) ?? 0)) return;
 
-    warnedThresholds.set(key, threshold);
+    const threshold = [90, 75, 50].find(value => used >= value);
+    const burnRate = getBurnRateSummary(snapshot);
+    const thresholdWarning = threshold !== undefined && threshold > (warnedThresholds.get(key) ?? 0)
+        ? `Copilot: ${formatPercent(used)}% of your ${formatQuotaType(type)} allowance is used (${threshold}% warning). For docs, explanations, or small tests, consider GPT-5 mini if available at lower cost or a lower usage multiplier than your current model.${burnRate ? ` Estimated burn rate is ${formatRequestRate(burnRate.averagePerDay)} requests/day, with projected remaining of ${formatPercent(burnRate.projectedRemaining)}%.` : ''}`
+        : undefined;
+    const warningMessage = thresholdWarning;
+
+    if (!warningMessage) return;
+
+    if (threshold !== undefined && threshold > (warnedThresholds.get(key) ?? 0)) {
+        warnedThresholds.set(key, threshold);
+    }
+
     void vscode.window.showWarningMessage(
-        `Copilot: ${formatPercent(used)}% of your ${formatQuotaType(type)} allowance is used (${threshold}% warning). For docs, explanations, or small tests, consider GPT-5 mini if available at lower cost or a lower usage multiplier than your current model.`,
+        warningMessage,
         'View Usage',
         'Model Suggestions'
     ).then(choice => {
@@ -422,6 +440,13 @@ function buildTooltip(type: string, snapshot: QuotaSnapshot): vscode.MarkdownStr
 
         md.appendMarkdown(`**Used:** ${snapshot.usedRequests.toLocaleString()} / ${snapshot.entitlementRequests.toLocaleString()}\n\n`);
         md.appendMarkdown(`**Remaining:** ${remainingRequests.toLocaleString()} requests (${formatPercent(snapshot.remainingPercentage)}%)\n\n`);
+
+        const burnRate = getBurnRateSummary(snapshot);
+        if (burnRate) {
+            md.appendMarkdown(`**Average burn rate:** ${formatRequestRate(burnRate.averagePerDay)} / day\n\n`);
+            md.appendMarkdown(`**Estimated usage until reset:** ${Math.round(burnRate.projectedUsageUntilReset).toLocaleString()}\n\n`);
+            md.appendMarkdown(`**Projected remaining:** ${buildUsageBar(burnRate.projectedRemaining)} ${formatPercent(burnRate.projectedRemaining)}%\n\n`);
+        }
     }
 
     const showReset = vscode.workspace
@@ -449,6 +474,7 @@ async function showDetails(): Promise<void> {
         ? undefined
         : Math.max(0, snapshot.entitlementRequests - snapshot.usedRequests);
     const remaining = Math.max(0, Math.min(100, snapshot.remainingPercentage));
+    const burnRate = getBurnRateSummary(snapshot);
 
     const lines = [
         unlimited
@@ -462,6 +488,14 @@ async function showDetails(): Promise<void> {
             `Allowance: ${snapshot.entitlementRequests.toLocaleString()} requests`,
             `Remaining: ${remainingRequests!.toLocaleString()} requests`
         );
+
+        if (burnRate) {
+            lines.push(
+                `Average: ${formatRequestRate(burnRate.averagePerDay)} per day`,
+                `Estimated usage until reset: ${Math.round(burnRate.projectedUsageUntilReset).toLocaleString()}`,
+                `Projected remaining: ${buildUsageBar(burnRate.projectedRemaining)} ${formatPercent(burnRate.projectedRemaining)}%`
+            );
+        }
     }
 
     const showReset = vscode.workspace.getConfiguration('copilotQuota').get<boolean>('showResetDate', true);
@@ -482,6 +516,61 @@ async function showDetails(): Promise<void> {
     } else if (choice === 'Model Suggestions') {
         await showModelSuggestions();
     }
+}
+
+function getBurnRateSummary(snapshot: QuotaSnapshot): BurnRateSummary | undefined {
+    if (snapshot.entitlementRequests <= 0 || !snapshot.resetDate) {
+        return undefined;
+    }
+
+    const resetDate = new Date(snapshot.resetDate);
+    if (Number.isNaN(resetDate.getTime())) {
+        return undefined;
+    }
+
+    const now = new Date();
+    if (resetDate.getTime() <= now.getTime()) {
+        return undefined;
+    }
+
+    const cycleDays = 30;
+    const daysRemaining = Math.max(1, Math.ceil((resetDate.getTime() - now.getTime()) / 86_400_000));
+    const daysElapsed = Math.max(1, cycleDays - daysRemaining);
+    const averagePerDay = snapshot.usedRequests / daysElapsed;
+    const projectedUsageUntilReset = averagePerDay * daysRemaining;
+    const projectedRemaining = Math.max(
+        0,
+        Math.min(100, ((snapshot.entitlementRequests - projectedUsageUntilReset) / snapshot.entitlementRequests) * 100)
+    );
+    const dailyAllowance = snapshot.entitlementRequests / cycleDays;
+    const isHighRate = (
+        averagePerDay >= Math.max(1, dailyAllowance * 0.8) && projectedRemaining <= 40
+    ) || (
+        snapshot.remainingPercentage <= 20 && daysRemaining <= 7
+    );
+
+    return {
+        averagePerDay,
+        projectedUsageUntilReset,
+        projectedRemaining,
+        daysRemaining,
+        isHighRate
+    };
+}
+
+function buildUsageBar(percent: number): string {
+    const blocks = 20;
+    const filled = Math.max(0, Math.min(blocks, Math.round((percent / 100) * blocks)));
+    return `${'█'.repeat(filled)}${'░'.repeat(blocks - filled)}`;
+}
+
+function formatRequestRate(value: number): string {
+    return `${Math.round(value).toLocaleString()}`;
+}
+
+function formatDaysUntilReset(days: number): string {
+    if (days <= 1) return '1 day';
+    return `${days} days`;
 }
 
 function formatPercent(value: number): string {
