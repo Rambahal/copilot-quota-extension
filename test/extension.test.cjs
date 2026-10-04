@@ -13,7 +13,14 @@ async function createHarness(settings = {}) {
     const details = [];
     const panels = [];
     const openedUrls = [];
+    const configUpdates = [];
     const statusBar = { show() {} };
+    const store = new Map(Object.entries(settings.globalState ?? {}));
+    const globalState = {
+        get: (key, fallback) => store.has(key) ? store.get(key) : fallback,
+        async update(key, value) { store.set(key, value); },
+        entries: () => [...store.entries()]
+    };
     let session = settings.session;
     let configurationListener;
     let quotaCalls = 0;
@@ -46,7 +53,11 @@ async function createHarness(settings = {}) {
             getConfiguration: name => ({
                 get: (key, fallback) => name === 'github-enterprise'
                     ? settings.githubEnterpriseUri ?? fallback
-                    : settings.configuration?.[key] ?? fallback
+                    : settings.configuration?.[key] ?? fallback,
+                async update(key, value, target) {
+                    configUpdates.push({ section: name, key, value, target });
+                    settings.configuration = { ...settings.configuration, [key]: value };
+                }
             }),
             onDidChangeConfiguration: listener => {
                 configurationListener = listener;
@@ -81,6 +92,7 @@ async function createHarness(settings = {}) {
         },
         StatusBarAlignment: { Right: 2 },
         ViewColumn: { Active: -1 },
+        ConfigurationTarget: { Global: 1 },
         ThemeColor: class { constructor(id) { this.id = id; } },
         MarkdownString: class { appendMarkdown() {} }
     };
@@ -130,9 +142,9 @@ async function createHarness(settings = {}) {
             return sdk;
         }
     }).runInContext(context);
-    await context.exports.activate({ subscriptions: [] });
+    await context.exports.activate({ subscriptions: [], globalState });
     return {
-        commands, clients, authRequests, logs, statusBar, warnings, details, panels, openedUrls,
+        commands, clients, authRequests, logs, statusBar, warnings, details, panels, openedUrls, globalState, configUpdates,
         get quotaCalls() { return quotaCalls; },
         setSession(value) { session = value; },
         async setEnterpriseUri(value) {
@@ -281,20 +293,151 @@ test('burn rate details show projected remaining and windowed usage pacing', asy
         cliAuthenticated: true,
         snapshot: {
             entitlementRequests: 1000,
-            usedRequests: 750,
-            remainingPercentage: 25,
+            usedRequests: 900,
+            remainingPercentage: 10,
             resetDate: date
         }
     };
     const harness = await createHarness(settings);
     await harness.commands.get('copilotQuota.showDetails')();
     assert.equal(harness.details.length, 1);
-    assert.match(harness.details[0].options.detail, /Average: \d+ per day/);
-    assert.match(harness.details[0].options.detail, /Estimated usage until reset:/);
-    assert.match(harness.details[0].options.detail, /Projected remaining:/);
+    assert.match(harness.details[0].options.detail, /Daily average: \d+ requests/);
+    assert.match(harness.details[0].options.detail, /Estimated usage until reset: 180 \(≈ \$1\.80\) — about \$0\.80 over budget/);
+    assert.match(harness.details[0].options.detail, /Projected remaining at reset:/);
+    assert.match(harness.details[0].options.detail, /may run out before reset/);
 });
 
-test('usage jumps show only the highest warning and reset dates rearm notifications', async () => {
+test('a snapshot-time reset date is ignored and the configured cycle day anchors the projection', async () => {
+    const key = 'copilotQuota.usageHistory:["github.com","cli"]:premium_interactions';
+    const snapshotTime = new Date(Date.now() - 30 * 1000).toISOString();
+    const settings = {
+        cliAuthenticated: true,
+        snapshot: { entitlementRequests: 10000, usedRequests: 1050, remainingPercentage: 89.5, resetDate: snapshotTime }
+    };
+    const harness = await createHarness(settings);
+    await harness.commands.get('copilotQuota.showDetails')();
+    const detail = harness.details[0].options.detail;
+    assert.match(detail, /Daily average: \d+ requests/);
+    assert.match(detail, /Estimated usage until reset: [\d,]+ \(≈ \$[\d,]+\.\d{2}\)\n/);
+    assert.doesNotMatch(detail, /over budget/);
+    assert.match(detail, /Projected remaining at reset:/);
+    assert.match(detail, /Resets: .*2026/);
+    assert.doesNotMatch(detail, /assumed/);
+
+    settings.configuration = { cycleResetDay: 0 };
+    const disabled = await createHarness(settings);
+    await disabled.commands.get('copilotQuota.showDetails')();
+    assert.doesNotMatch(disabled.details[0].options.detail, /Daily average|Projected remaining|may run out/);
+    assert.match(disabled.details[0].options.detail, /Resets: Not provided/);
+
+    settings.globalState = { [key]: { resetDate: snapshotTime, samples: [{ time: Date.now() - 3 * 60 * 60 * 1000, used: 1038 }] } };
+    const measured = await createHarness(settings);
+    await measured.commands.get('copilotQuota.showDetails')();
+    assert.match(measured.details[0].options.detail, /Daily average: 96 requests/);
+    assert.doesNotMatch(measured.details[0].options.detail, /Projected remaining|may run out/);
+});
+
+test('burn rate falls back to locally recorded usage when no reset date can be determined', async () => {
+    const key = 'copilotQuota.usageHistory:["github.com","cli"]:premium_interactions';
+    const twoDaysAgo = Date.now() - 2 * 24 * 60 * 60 * 1000;
+    const harness = await createHarness({
+        cliAuthenticated: true,
+        configuration: { cycleResetDay: 0 },
+        snapshot: { entitlementRequests: 1000, usedRequests: 250, remainingPercentage: 75 },
+        globalState: { [key]: { resetDate: null, samples: [{ time: twoDaysAgo, used: 98 }] } }
+    });
+    await harness.commands.get('copilotQuota.showDetails')();
+    assert.match(harness.details[0].options.detail, /Daily average: 76 requests/);
+    assert.doesNotMatch(harness.details[0].options.detail, /Estimated usage until reset:/);
+    assert.equal(harness.globalState.get(key).samples.length, 2);
+    assert.equal(harness.warnings.length, 0);
+});
+
+test('usage history restarts when used requests drop but survives a drifting reset date', async () => {
+    const key = 'copilotQuota.usageHistory:["github.com","cli"]:premium_interactions';
+    const settings = {
+        cliAuthenticated: true,
+        snapshot: { entitlementRequests: 1000, usedRequests: 250, remainingPercentage: 75, resetDate: '2026-11-01' },
+        globalState: { [key]: { resetDate: '2026-11-01', samples: [{ time: Date.now() - 60 * 60 * 1000, used: 240 }] } }
+    };
+    const harness = await createHarness(settings);
+    assert.equal(harness.globalState.get(key).samples.length, 2);
+    settings.snapshot.resetDate = '2026-11-01T00:10:00Z';
+    await harness.commands.get('copilotQuota.refresh')();
+    assert.equal(harness.globalState.get(key).samples.length, 3);
+    settings.snapshot.usedRequests = 5;
+    await harness.commands.get('copilotQuota.refresh')();
+    assert.equal(harness.globalState.get(key).samples.map(sample => sample.used).join(), '5');
+    assert.equal(harness.globalState.get(key).resetDate, '2026-11-01T00:10:00Z');
+});
+
+test('rapid usage shows a spike warning once and View Usage opens details', async () => {
+    const key = 'copilotQuota.usageHistory:["github.com","cli"]:premium_interactions';
+    const now = Date.now();
+    const settings = {
+        cliAuthenticated: true,
+        warningAction: 'View Usage',
+        snapshot: { entitlementRequests: 10000, usedRequests: 710, remainingPercentage: 92.9 },
+        globalState: { [key]: { resetDate: null, samples: [
+            { time: now - 2.5 * 24 * 60 * 60 * 1000, used: 0 },
+            { time: now - 45 * 60 * 1000, used: 595 }
+        ] } }
+    };
+    const harness = await createHarness(settings);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.warnings.length, 1);
+    assert.match(harness.warnings[0].message, /unusually high: 115 requests in the last 45 minutes is about 11x the pace/);
+    assert.match(harness.warnings[0].message, /7\.1% of your monthly quota in the last 3 days\.$/);
+    assert.deepEqual(harness.warnings[0].actions, ['View Usage', 'Dismiss', 'Disable Warning']);
+    assert.equal(harness.details.length, 1);
+    settings.snapshot.usedRequests = 1200;
+    await harness.commands.get('copilotQuota.refresh')();
+    assert.equal(harness.warnings.length, 1);
+});
+
+test('Disable Warning on a spike turns the setting off globally', async () => {
+    const key = 'copilotQuota.usageHistory:["github.com","cli"]:premium_interactions';
+    const now = Date.now();
+    const harness = await createHarness({
+        cliAuthenticated: true,
+        warningAction: 'Disable Warning',
+        snapshot: { entitlementRequests: 10000, usedRequests: 710, remainingPercentage: 92.9 },
+        globalState: { [key]: { resetDate: null, samples: [{ time: now - 45 * 60 * 1000, used: 595 }] } }
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.warnings.length, 1);
+    assert.match(harness.warnings[0].message, /pace your allowance supports\.$/);
+    assert.deepEqual(harness.configUpdates, [{ section: 'copilotQuota', key: 'spikeHourlyPercent', value: 0, target: 1 }]);
+    assert.equal(harness.details.length, 0);
+});
+
+test('moderate usage, short spans and a disabled threshold do not trigger spike warnings', async () => {
+    const key = 'copilotQuota.usageHistory:["github.com","cli"]:premium_interactions';
+    const now = Date.now();
+    const belowThreshold = await createHarness({
+        cliAuthenticated: true,
+        snapshot: { entitlementRequests: 10000, usedRequests: 90, remainingPercentage: 99 },
+        globalState: { [key]: { resetDate: null, samples: [{ time: now - 50 * 60 * 1000, used: 0 }] } }
+    });
+    assert.equal(belowThreshold.warnings.length, 0);
+
+    const shortSpan = await createHarness({
+        cliAuthenticated: true,
+        snapshot: { entitlementRequests: 10000, usedRequests: 500, remainingPercentage: 95 },
+        globalState: { [key]: { resetDate: null, samples: [{ time: now - 10 * 60 * 1000, used: 0 }] } }
+    });
+    assert.equal(shortSpan.warnings.length, 0);
+
+    const disabled = await createHarness({
+        cliAuthenticated: true,
+        configuration: { spikeHourlyPercent: 0 },
+        snapshot: { entitlementRequests: 10000, usedRequests: 500, remainingPercentage: 95 },
+        globalState: { [key]: { resetDate: null, samples: [{ time: now - 50 * 60 * 1000, used: 0 }] } }
+    });
+    assert.equal(disabled.warnings.length, 0);
+});
+
+test('usage jumps show only the highest warning and a new cycle rearms notifications', async () => {
     const settings = {
         cliAuthenticated: true,
         snapshot: { entitlementRequests: 100, usedRequests: 95, remainingPercentage: 5, resetDate: '2026-10-01' }
@@ -302,10 +445,11 @@ test('usage jumps show only the highest warning and reset dates rearm notificati
     const harness = await createHarness(settings);
     assert.equal(harness.warnings.length, 1);
     assert.match(harness.warnings[0].message, /90% warning/);
-    settings.snapshot.remainingPercentage = 40;
+    settings.snapshot.resetDate = '2026-11-01';
     await harness.commands.get('copilotQuota.refresh')();
     assert.equal(harness.warnings.length, 1);
-    settings.snapshot.resetDate = '2026-11-01';
+    settings.snapshot.usedRequests = 60;
+    settings.snapshot.remainingPercentage = 40;
     await harness.commands.get('copilotQuota.refresh')();
     assert.equal(harness.warnings.length, 2);
     assert.match(harness.warnings[1].message, /50% warning/);
@@ -331,9 +475,52 @@ test('usage dialog shows structured details and Refresh reopens the updated view
     assert.equal(dialog.message, 'Copilot Usage: Premium model');
     assert.equal(dialog.options.modal, true);
     assert.match(dialog.options.detail, /Usage: 20% used \| 80% remaining/);
-    assert.match(dialog.options.detail, /Used: 20 requests\n\nAllowance: 100 requests\n\nRemaining: 80 requests/);
-    assert.match(dialog.options.detail, /Resets: Not provided/);
+    assert.match(dialog.options.detail, /Used: 20 requests \(≈ \$0\.20\)\n\nAllowance: 100 requests \(≈ \$1\.00\)\n\nRemaining: 80 requests \(≈ \$0\.80\)/);
+    assert.match(dialog.options.detail, /Resets: .*20\d\d/);
     assert.deepEqual(dialog.actions, ['Refresh', 'Model Suggestions']);
+});
+
+test('details estimate when the allowance runs out at the current rate', async () => {
+    const inFiveDays = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    const early = await createHarness({
+        cliAuthenticated: true,
+        snapshot: { entitlementRequests: 1000, usedRequests: 750, remainingPercentage: 25, resetDate: inFiveDays }
+    });
+    await early.commands.get('copilotQuota.showDetails')();
+    assert.match(early.details[0].options.detail, /Runs out: not before the reset at this rate/);
+    assert.doesNotMatch(early.details[0].options.detail, /may run out before reset/);
+
+    const inTwentyDays = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000).toISOString();
+    const late = await createHarness({
+        cliAuthenticated: true,
+        snapshot: { entitlementRequests: 1000, usedRequests: 900, remainingPercentage: 10, resetDate: inTwentyDays }
+    });
+    await late.commands.get('copilotQuota.showDetails')();
+    assert.match(late.details[0].options.detail, /Runs out: in about 1 day \(.+\), before the reset/);
+
+    const key = 'copilotQuota.usageHistory:["github.com","cli"]:premium_interactions';
+    const measured = await createHarness({
+        cliAuthenticated: true,
+        configuration: { cycleResetDay: 0 },
+        snapshot: { entitlementRequests: 1000, usedRequests: 250, remainingPercentage: 75 },
+        globalState: { [key]: { resetDate: null, samples: [{ time: Date.now() - 2 * 24 * 60 * 60 * 1000, used: 100 }] } }
+    });
+    await measured.commands.get('copilotQuota.showDetails')();
+    assert.match(measured.details[0].options.detail, /Runs out: in about 10 days \(.+\)\n/);
+});
+
+test('cost estimates follow the configured rate and are hidden when set to zero', async () => {
+    const date = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    const snapshot = { entitlementRequests: 1000, usedRequests: 750, remainingPercentage: 25, resetDate: date };
+    const legacy = await createHarness({ cliAuthenticated: true, snapshot, configuration: { costPerRequestUsd: 0.04 } });
+    await legacy.commands.get('copilotQuota.showDetails')();
+    assert.match(legacy.details[0].options.detail, /Used: 750 requests \(≈ \$30\.00\)/);
+    assert.match(legacy.details[0].options.detail, /Estimated usage until reset: 150 \(≈ \$6\.00\)\n/);
+    assert.doesNotMatch(legacy.details[0].options.detail, /over budget/);
+
+    const hidden = await createHarness({ cliAuthenticated: true, snapshot, configuration: { costPerRequestUsd: 0 } });
+    await hidden.commands.get('copilotQuota.showDetails')();
+    assert.doesNotMatch(hidden.details[0].options.detail, /\$/);
 });
 
 test('warning suggestions explain task fit without making extra quota or model requests', async () => {

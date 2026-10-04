@@ -14,12 +14,28 @@ type QuotaResult = {
 
 type BurnRateSummary = {
     averagePerDay: number;
-    projectedUsageUntilReset: number;
-    projectedRemaining: number;
-    daysRemaining: number;
+    daysUntilExhausted?: number;
+    projectedUsageUntilReset?: number;
+    projectedRemaining?: number;
+    daysRemaining?: number;
     isHighRate: boolean;
 };
 
+type UsageSample = { time: number; used: number };
+type UsageHistory = { resetDate: string | null; samples: UsageSample[] };
+type UsageSpike = { recentUsed: number; recentMinutes: number; paceMultiple: number; context?: { percentUsed: number; label: string } };
+
+const MINUTE_MS = 60_000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 86_400_000;
+const HISTORY_RETENTION_MS = 30 * DAY_MS;
+const MAX_HISTORY_SAMPLES = 10_000;
+const SPIKE_RECENT_WINDOW_MS = HOUR_MS;
+const SPIKE_MIN_SPAN_MS = 20 * MINUTE_MS;
+const SPIKE_CONTEXT_DAYS = 3;
+const SPIKE_MUTE_MS = 60 * MINUTE_MS;
+
+let extensionContext: vscode.ExtensionContext | undefined;
 let client: CopilotClient | undefined;
 let clientToken: string | undefined;
 let clientHost: string | undefined;
@@ -28,12 +44,15 @@ let statusBar: vscode.StatusBarItem | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
 let modelSuggestionsPanel: vscode.WebviewPanel | undefined;
 let lastSnapshot: QuotaSnapshot | undefined;
+let lastSamples: UsageSample[] = [];
 let lastQuotaType = 'premium_interactions';
 let loading = false;
 let quotaAccount = 'cli';
+let spikeMutedUntil = 0;
 const warnedThresholds = new Map<string, number>();
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    extensionContext = context;
     outputChannel = vscode.window.createOutputChannel('Copilot Quota');
     context.subscriptions.push(outputChannel);
     log('Extension activated.');
@@ -194,8 +213,10 @@ async function refresh(showErrors: boolean, signIn = false): Promise<void> {
         log(`Updating status bar from quota '${type}' with remainingPercentage=${String(snapshot.remainingPercentage)}, usedRequests=${String(snapshot.usedRequests)}, entitlementRequests=${String(snapshot.entitlementRequests)}.`);
         lastQuotaType = type;
         lastSnapshot = snapshot;
+        const { samples, newCycle } = recordUsageSample(type, snapshot);
+        lastSamples = samples;
         updateStatusBar(type, snapshot);
-        warnAboutUsage(type, snapshot);
+        warnAboutUsage(type, snapshot, newCycle);
     } catch (error) {
         const failedClient = client;
         client = undefined;
@@ -225,19 +246,21 @@ async function refresh(showErrors: boolean, signIn = false): Promise<void> {
     }
 }
 
-function warnAboutUsage(type: string, snapshot: QuotaSnapshot): void {
+function warnAboutUsage(type: string, snapshot: QuotaSnapshot, newCycle: boolean): void {
     if (snapshot.entitlementRequests <= 0 || !Number.isFinite(snapshot.remainingPercentage)) return;
 
     const used = 100 - Math.max(0, Math.min(100, snapshot.remainingPercentage));
-    const key = JSON.stringify([quotaAccount, type, snapshot.resetDate ?? null]);
-    if (!snapshot.resetDate && used === 0) {
+    const key = JSON.stringify([quotaAccount, type]);
+    if (newCycle || used === 0) {
         warnedThresholds.delete(key);
     }
 
+    warnAboutUsageSpike(snapshot);
+
     const threshold = [90, 75, 50].find(value => used >= value);
-    const burnRate = getBurnRateSummary(snapshot);
+    const burnRate = getBurnRateSummary(snapshot, lastSamples);
     const thresholdWarning = threshold !== undefined && threshold > (warnedThresholds.get(key) ?? 0)
-        ? `Copilot: ${formatPercent(used)}% of your ${formatQuotaType(type)} allowance is used (${threshold}% warning). For docs, explanations, or small tests, consider GPT-5 mini if available at lower cost or a lower usage multiplier than your current model.${burnRate ? ` Estimated burn rate is ${formatRequestRate(burnRate.averagePerDay)} requests/day, with projected remaining of ${formatPercent(burnRate.projectedRemaining)}%.` : ''}`
+        ? `Copilot: ${formatPercent(used)}% of your ${formatQuotaType(type)} allowance is used (${threshold}% warning). For docs, explanations, or small tests, consider GPT-5 mini if available at lower cost or a lower usage multiplier than your current model.${burnRate ? ` Estimated burn rate is ${formatRequestRate(burnRate.averagePerDay)} requests/day${burnRate.projectedRemaining !== undefined ? `, with projected remaining of ${formatPercent(burnRate.projectedRemaining)}%` : ''}.` : ''}`
         : undefined;
     const warningMessage = thresholdWarning;
 
@@ -255,6 +278,86 @@ function warnAboutUsage(type: string, snapshot: QuotaSnapshot): void {
         if (choice === 'View Usage') return showDetails();
         if (choice === 'Model Suggestions') return showModelSuggestions();
     }).then(undefined, error => log(`Unable to show usage warning: ${String(error)}`));
+}
+
+function warnAboutUsageSpike(snapshot: QuotaSnapshot): void {
+    const spike = detectUsageSpike(snapshot, lastSamples);
+    if (!spike || Date.now() < spikeMutedUntil) return;
+
+    spikeMutedUntil = Date.now() + SPIKE_MUTE_MS;
+    const contextSentence = spike.context
+        ? ` You've used ${formatPercent(spike.context.percentUsed)}% of your monthly quota in the last ${spike.context.label}.`
+        : '';
+    log(`Usage spike detected: ${spike.recentUsed} requests in ${spike.recentMinutes} min (${spike.paceMultiple.toFixed(1)}x sustainable pace).${contextSentence}`);
+    void vscode.window.showWarningMessage(
+        `Your current usage rate is unusually high: ${spike.recentUsed.toLocaleString()} requests in the last ${spike.recentMinutes} minutes is about ${Math.round(spike.paceMultiple)}x the pace your allowance supports.${contextSentence}`,
+        'View Usage',
+        'Dismiss',
+        'Disable Warning'
+    ).then(choice => {
+        if (choice === 'View Usage') return showDetails();
+        if (choice === 'Disable Warning') {
+            return vscode.workspace.getConfiguration('copilotQuota')
+                .update('spikeHourlyPercent', 0, vscode.ConfigurationTarget.Global);
+        }
+    }).then(undefined, error => log(`Unable to show usage spike warning: ${String(error)}`));
+}
+
+function recordUsageSample(type: string, snapshot: QuotaSnapshot): { samples: UsageSample[]; newCycle: boolean } {
+    const key = `copilotQuota.usageHistory:${quotaAccount}:${type}`;
+    const stored = extensionContext?.globalState.get<UsageHistory>(key);
+    const resetDate = snapshot.resetDate ?? null;
+    const last = stored?.samples[stored.samples.length - 1];
+    // Only a drop in used requests marks a new cycle; the reported reset date can drift between polls.
+    const newCycle = last !== undefined && snapshot.usedRequests < last.used;
+    const now = Date.now();
+    const samples = (newCycle || !stored ? [] : stored.samples)
+        .filter(sample => now - sample.time <= HISTORY_RETENTION_MS)
+        .slice(-(MAX_HISTORY_SAMPLES - 1));
+    samples.push({ time: now, used: snapshot.usedRequests });
+    void extensionContext?.globalState.update(key, { resetDate, samples } satisfies UsageHistory);
+    return { samples, newCycle };
+}
+
+function detectUsageSpike(snapshot: QuotaSnapshot, samples: UsageSample[]): UsageSpike | undefined {
+    if (snapshot.entitlementRequests <= 0) return undefined;
+
+    const thresholdPercent = vscode.workspace.getConfiguration('copilotQuota').get<number>('spikeHourlyPercent', 1);
+    if (!(thresholdPercent > 0)) return undefined;
+
+    const now = Date.now();
+    // Oldest sample inside the recent window; the span must be long enough that a single request cannot look like a trend.
+    const baseline = samples.find(sample => now - sample.time <= SPIKE_RECENT_WINDOW_MS);
+    if (!baseline || now - baseline.time < SPIKE_MIN_SPAN_MS) return undefined;
+
+    const recentUsed = snapshot.usedRequests - baseline.used;
+    const recentPercent = (recentUsed / snapshot.entitlementRequests) * 100;
+    if (recentPercent < thresholdPercent) return undefined;
+
+    const spanDays = (now - baseline.time) / DAY_MS;
+    const sustainablePerDay = snapshot.entitlementRequests / 30;
+    const contextStart = samples.find(sample => now - sample.time <= SPIKE_CONTEXT_DAYS * DAY_MS);
+    const context = contextStart && contextStart !== baseline
+        ? {
+            percentUsed: (Math.max(0, snapshot.usedRequests - contextStart.used) / snapshot.entitlementRequests) * 100,
+            label: formatDuration(now - contextStart.time)
+        }
+        : undefined;
+    return {
+        recentUsed,
+        recentMinutes: Math.round((now - baseline.time) / MINUTE_MS),
+        paceMultiple: recentUsed / (sustainablePerDay * spanDays),
+        context
+    };
+}
+
+function formatDuration(ms: number): string {
+    if (ms < HOUR_MS) return `${Math.max(1, Math.round(ms / MINUTE_MS))} minutes`;
+    if (ms < DAY_MS) {
+        const hours = Math.round(ms / HOUR_MS);
+        return hours === 1 ? '1 hour' : `${hours} hours`;
+    }
+    return formatDays(Math.round(ms / DAY_MS));
 }
 
 async function showModelSuggestions(): Promise<void> {
@@ -426,6 +529,7 @@ function setStatusError(message: string): void {
 function buildTooltip(type: string, snapshot: QuotaSnapshot): vscode.MarkdownString {
     const md = new vscode.MarkdownString();
     md.isTrusted = false;
+    md.supportThemeIcons = true;
 
     md.appendMarkdown(`**GitHub Copilot quota**\n\n`);
     md.appendMarkdown(`Quota: ${formatQuotaType(type)}\n\n`);
@@ -438,14 +542,23 @@ function buildTooltip(type: string, snapshot: QuotaSnapshot): vscode.MarkdownStr
             snapshot.entitlementRequests - snapshot.usedRequests
         );
 
-        md.appendMarkdown(`**Used:** ${snapshot.usedRequests.toLocaleString()} / ${snapshot.entitlementRequests.toLocaleString()}\n\n`);
-        md.appendMarkdown(`**Remaining:** ${remainingRequests.toLocaleString()} requests (${formatPercent(snapshot.remainingPercentage)}%)\n\n`);
+        md.appendMarkdown(`**Used:** ${snapshot.usedRequests.toLocaleString()} / ${snapshot.entitlementRequests.toLocaleString()}${formatCost(snapshot.usedRequests)}\n\n`);
+        md.appendMarkdown(`**Remaining:** ${remainingRequests.toLocaleString()} requests (${formatPercent(snapshot.remainingPercentage)}%)${formatCost(remainingRequests)}\n\n`);
 
-        const burnRate = getBurnRateSummary(snapshot);
+        const burnRate = getBurnRateSummary(snapshot, lastSamples);
         if (burnRate) {
-            md.appendMarkdown(`**Average burn rate:** ${formatRequestRate(burnRate.averagePerDay)} / day\n\n`);
-            md.appendMarkdown(`**Estimated usage until reset:** ${Math.round(burnRate.projectedUsageUntilReset).toLocaleString()}\n\n`);
-            md.appendMarkdown(`**Projected remaining:** ${buildUsageBar(burnRate.projectedRemaining)} ${formatPercent(burnRate.projectedRemaining)}%\n\n`);
+            md.appendMarkdown(`**Daily average:** ${formatRequestRate(burnRate.averagePerDay)} requests${formatCost(burnRate.averagePerDay)}\n\n`);
+            const exhaustion = formatExhaustion(burnRate);
+            if (exhaustion) {
+                md.appendMarkdown(`**Runs out:** ${exhaustion}\n\n`);
+            }
+            if (burnRate.projectedUsageUntilReset !== undefined && burnRate.projectedRemaining !== undefined) {
+                md.appendMarkdown(`**Estimated usage until reset:** ${formatUsageUntilReset(snapshot, burnRate.projectedUsageUntilReset)}\n\n`);
+                md.appendMarkdown(`**Projected remaining at reset:** ${buildUsageBar(burnRate.projectedRemaining)} ${formatPercent(burnRate.projectedRemaining)}%\n\n`);
+            }
+            if (burnRate.isHighRate) {
+                md.appendMarkdown(`$(warning) At your current usage rate, your quota may run out before reset.\n\n`);
+            }
         }
     }
 
@@ -453,8 +566,9 @@ function buildTooltip(type: string, snapshot: QuotaSnapshot): vscode.MarkdownStr
         .getConfiguration('copilotQuota')
         .get<boolean>('showResetDate', true);
 
-    if (showReset && snapshot.resetDate) {
-        md.appendMarkdown(`**Resets:** ${formatDate(snapshot.resetDate)}\n\n`);
+    const reset = showReset ? formatReset(snapshot) : undefined;
+    if (reset) {
+        md.appendMarkdown(`**Resets:** ${reset}\n\n`);
     }
 
     md.appendMarkdown(`Click to view details or use **Copilot Quota: Refresh**.`);
@@ -474,33 +588,42 @@ async function showDetails(): Promise<void> {
         ? undefined
         : Math.max(0, snapshot.entitlementRequests - snapshot.usedRequests);
     const remaining = Math.max(0, Math.min(100, snapshot.remainingPercentage));
-    const burnRate = getBurnRateSummary(snapshot);
+    const burnRate = getBurnRateSummary(snapshot, lastSamples);
 
     const lines = [
         unlimited
             ? 'Allowance: Unlimited'
             : `Usage: ${formatPercent(100 - remaining)}% used | ${formatPercent(remaining)}% remaining`,
-        `Used: ${snapshot.usedRequests.toLocaleString()} requests`
+        `Used: ${snapshot.usedRequests.toLocaleString()} requests${formatCost(snapshot.usedRequests)}`
     ];
 
     if (!unlimited) {
         lines.push(
-            `Allowance: ${snapshot.entitlementRequests.toLocaleString()} requests`,
-            `Remaining: ${remainingRequests!.toLocaleString()} requests`
+            `Allowance: ${snapshot.entitlementRequests.toLocaleString()} requests${formatCost(snapshot.entitlementRequests)}`,
+            `Remaining: ${remainingRequests!.toLocaleString()} requests${formatCost(remainingRequests!)}`
         );
 
         if (burnRate) {
-            lines.push(
-                `Average: ${formatRequestRate(burnRate.averagePerDay)} per day`,
-                `Estimated usage until reset: ${Math.round(burnRate.projectedUsageUntilReset).toLocaleString()}`,
-                `Projected remaining: ${buildUsageBar(burnRate.projectedRemaining)} ${formatPercent(burnRate.projectedRemaining)}%`
-            );
+            lines.push(`Daily average: ${formatRequestRate(burnRate.averagePerDay)} requests${formatCost(burnRate.averagePerDay)}`);
+            const exhaustion = formatExhaustion(burnRate);
+            if (exhaustion) {
+                lines.push(`Runs out: ${exhaustion}`);
+            }
+            if (burnRate.projectedUsageUntilReset !== undefined && burnRate.projectedRemaining !== undefined) {
+                lines.push(
+                    `Estimated usage until reset: ${formatUsageUntilReset(snapshot, burnRate.projectedUsageUntilReset)}`,
+                    `Projected remaining at reset: ${buildUsageBar(burnRate.projectedRemaining)} ${formatPercent(burnRate.projectedRemaining)}%`
+                );
+            }
+            if (burnRate.isHighRate) {
+                lines.push('⚠ At your current usage rate, your quota may run out before reset.');
+            }
         }
     }
 
     const showReset = vscode.workspace.getConfiguration('copilotQuota').get<boolean>('showResetDate', true);
     if (showReset) {
-        lines.push(snapshot.resetDate ? `Resets: ${formatDate(snapshot.resetDate)}` : 'Resets: Not provided');
+        lines.push(`Resets: ${formatReset(snapshot) ?? 'Not provided'}`);
     }
 
     const choice = await vscode.window.showInformationMessage(
@@ -518,44 +641,112 @@ async function showDetails(): Promise<void> {
     }
 }
 
-function getBurnRateSummary(snapshot: QuotaSnapshot): BurnRateSummary | undefined {
-    if (snapshot.entitlementRequests <= 0 || !snapshot.resetDate) {
+function getBurnRateSummary(snapshot: QuotaSnapshot, samples: UsageSample[]): BurnRateSummary | undefined {
+    if (snapshot.entitlementRequests <= 0) {
         return undefined;
     }
 
-    const resetDate = new Date(snapshot.resetDate);
-    if (Number.isNaN(resetDate.getTime())) {
-        return undefined;
+    const now = Date.now();
+    const measuredPerDay = getMeasuredRate(snapshot, samples, now);
+    const reset = getResetInfo(snapshot, now);
+
+    if (!reset) {
+        return measuredPerDay === undefined
+            ? undefined
+            : { averagePerDay: measuredPerDay, daysUntilExhausted: getDaysUntilExhausted(snapshot, measuredPerDay), isHighRate: false };
     }
 
-    const now = new Date();
-    if (resetDate.getTime() <= now.getTime()) {
-        return undefined;
-    }
-
-    const cycleDays = 30;
-    const daysRemaining = Math.max(1, Math.ceil((resetDate.getTime() - now.getTime()) / 86_400_000));
-    const daysElapsed = Math.max(1, cycleDays - daysRemaining);
-    const averagePerDay = snapshot.usedRequests / daysElapsed;
+    const resetTime = reset.time;
+    const cycleStart = addMonths(resetTime, -1);
+    const cycleDays = (resetTime - cycleStart) / DAY_MS;
+    const daysRemaining = (resetTime - now) / DAY_MS;
+    const daysElapsed = (now - cycleStart) / DAY_MS;
+    // Early in a cycle the cycle average is unstable, so prefer the measured rate when available.
+    const averagePerDay = daysElapsed >= 1
+        ? snapshot.usedRequests / daysElapsed
+        : measuredPerDay ?? snapshot.usedRequests / Math.max(daysElapsed, 1);
     const projectedUsageUntilReset = averagePerDay * daysRemaining;
     const projectedRemaining = Math.max(
         0,
-        Math.min(100, ((snapshot.entitlementRequests - projectedUsageUntilReset) / snapshot.entitlementRequests) * 100)
+        Math.min(100, ((snapshot.entitlementRequests - snapshot.usedRequests - projectedUsageUntilReset) / snapshot.entitlementRequests) * 100)
     );
-    const dailyAllowance = snapshot.entitlementRequests / cycleDays;
-    const isHighRate = (
-        averagePerDay >= Math.max(1, dailyAllowance * 0.8) && projectedRemaining <= 40
-    ) || (
-        snapshot.remainingPercentage <= 20 && daysRemaining <= 7
-    );
+    const daysUntilExhausted = getDaysUntilExhausted(snapshot, averagePerDay);
+    const isHighRate = daysUntilExhausted !== undefined && daysUntilExhausted < daysRemaining;
 
     return {
         averagePerDay,
+        daysUntilExhausted,
         projectedUsageUntilReset,
         projectedRemaining,
         daysRemaining,
         isHighRate
     };
+}
+
+function getDaysUntilExhausted(snapshot: QuotaSnapshot, averagePerDay: number): number | undefined {
+    if (!(averagePerDay > 0)) return undefined;
+    const remaining = Math.max(0, snapshot.entitlementRequests - snapshot.usedRequests);
+    return remaining / averagePerDay;
+}
+
+function formatExhaustion(burnRate: BurnRateSummary): string | undefined {
+    if (burnRate.daysUntilExhausted === undefined) return undefined;
+    const days = burnRate.daysUntilExhausted;
+    if (burnRate.daysRemaining !== undefined && days >= burnRate.daysRemaining) {
+        return 'not before the reset at this rate';
+    }
+    const date = formatDate(new Date(Date.now() + days * DAY_MS).toISOString());
+    const when = days < 1 ? 'within a day' : `in about ${formatDays(Math.round(days))}`;
+    return `${when} (${date})${burnRate.daysRemaining !== undefined ? ', before the reset' : ''}`;
+}
+
+type ResetInfo = { time: number; assumed: boolean };
+
+// Token-based billing reports the snapshot time as resetDate, so only a date well in the future is trusted.
+function getResetInfo(snapshot: QuotaSnapshot, now: number): ResetInfo | undefined {
+    const reported = snapshot.resetDate ? new Date(snapshot.resetDate).getTime() : NaN;
+    if (Number.isFinite(reported) && reported > now + HOUR_MS) {
+        return { time: reported, assumed: false };
+    }
+
+    const day = vscode.workspace.getConfiguration('copilotQuota').get<number>('cycleResetDay', 1);
+    if (!(day >= 1 && day <= 31)) return undefined;
+
+    const current = new Date(now);
+    const year = current.getUTCFullYear();
+    const month = current.getUTCMonth();
+    const thisMonth = utcDayOfMonth(year, month, day);
+    return { time: thisMonth > now ? thisMonth : utcDayOfMonth(year, month + 1, day), assumed: true };
+}
+
+function utcDayOfMonth(year: number, month: number, day: number): number {
+    const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+    return Date.UTC(year, month, Math.min(day, lastDay));
+}
+
+function formatReset(snapshot: QuotaSnapshot): string | undefined {
+    const reset = getResetInfo(snapshot, Date.now());
+    if (!reset) return undefined;
+    return formatDate(new Date(reset.time).toISOString());
+}
+
+function getMeasuredRate(snapshot: QuotaSnapshot, samples: UsageSample[], now: number): number | undefined {
+    const first = samples[0];
+    const spanDays = first ? (now - first.time) / DAY_MS : 0;
+    if (!first || spanDays * 24 < 1) {
+        return undefined;
+    }
+    return Math.max(0, snapshot.usedRequests - first.used) / spanDays;
+}
+
+function addMonths(time: number, months: number): number {
+    const date = new Date(time);
+    const day = date.getUTCDate();
+    date.setUTCDate(1);
+    date.setUTCMonth(date.getUTCMonth() + months);
+    const lastDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
+    date.setUTCDate(Math.min(day, lastDay));
+    return date.getTime();
 }
 
 function buildUsageBar(percent: number): string {
@@ -568,7 +759,27 @@ function formatRequestRate(value: number): string {
     return `${Math.round(value).toLocaleString()}`;
 }
 
-function formatDaysUntilReset(days: number): string {
+function formatCost(requests: number): string {
+    const rate = vscode.workspace.getConfiguration('copilotQuota').get<number>('costPerRequestUsd', 0.01);
+    if (!(rate > 0) || !Number.isFinite(requests)) return '';
+    return ` (≈ ${formatUsd(requests * rate)})`;
+}
+
+function formatUsd(value: number): string {
+    return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatUsageUntilReset(snapshot: QuotaSnapshot, projectedUsageUntilReset: number): string {
+    const base = `${Math.round(projectedUsageUntilReset).toLocaleString()}${formatCost(projectedUsageUntilReset)}`;
+    const rate = vscode.workspace.getConfiguration('copilotQuota').get<number>('costPerRequestUsd', 0.01);
+    const total = snapshot.usedRequests + projectedUsageUntilReset;
+    const extra = total - snapshot.entitlementRequests;
+    if (!(rate > 0) || extra <= 0) return base;
+
+    return `${base} — about ${formatUsd(extra * rate)} over budget`;
+}
+
+function formatDays(days: number): string {
     if (days <= 1) return '1 day';
     return `${days} days`;
 }

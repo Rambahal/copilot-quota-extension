@@ -2,7 +2,7 @@
   "name": "copilot-quota-monitor",
   "displayName": "Copilot Quota Monitor",
   "description": "Shows GitHub Copilot quota, remaining allowance, and reset date in the VS Code status bar.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "publisher": "RamBahalTiwari",
   "icon": "assets/copilot-quota-logo.png",
   "license": "MIT",
@@ -39,7 +39,7 @@
       "properties": {
         "copilotQuota.refreshIntervalMinutes": {
           "type": "number",
-          "default": 5,
+          "default": 1,
           "minimum": 1,
           "maximum": 60,
           "description": "How often to refresh Copilot quota information."
@@ -53,6 +53,25 @@
           "type": "boolean",
           "default": true,
           "description": "Show the quota reset date in the status bar tooltip."
+        },
+        "copilotQuota.cycleResetDay": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 31,
+          "description": "Day of the month (00:00 UTC) when the allowance resets. Used when the API does not report a future reset date, which is the case for token-based (AI Credits) billing where resetDate is just the snapshot time. GitHub AI Credits reset on the 1st. Set to 0 to disable projections in that case."
+        },
+        "copilotQuota.costPerRequestUsd": {
+          "type": "number",
+          "default": 0.01,
+          "minimum": 0,
+          "description": "USD value of one quota unit, used to show cost estimates. GitHub AI Credits are $0.01 each; legacy request-based plans charge $0.04 per additional premium request. Set to 0 to hide cost estimates."
+        },
+        "copilotQuota.spikeHourlyPercent": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "description": "Warn when more than this percentage of the monthly allowance is consumed within one hour (1% per hour is roughly 7x the pace that would last the full month). Set to 0 to disable spike warnings."
         }
       }
     }
